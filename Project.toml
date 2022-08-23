@@ -1,0 +1,8 @@
+name = "ZNG"
+uuid = "0ed97bbb-fe3d-4298-9346-f3863f624d8c"
+authors = ["quinnj <quinn.jacobd@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+CodecLz4 = "5ba52731-8f18-5e0d-9241-30f10d1ec561"
+EnumX = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
