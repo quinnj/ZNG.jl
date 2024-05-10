@@ -1,6 +1,6 @@
 module ZNG
 
-using CodecLz4, EnumX
+using CodecLz4, EnumX, Structs
 
 include("utils.jl")
 include("types.jl")
@@ -32,6 +32,7 @@ struct Frame
     code::FrameCode
     length::Int
     payload::Vector{UInt8} # uncompressed
+    pos::Int
 end
 
 function readframe(buf, pos, len)
@@ -40,13 +41,11 @@ function readframe(buf, pos, len)
     pos += 1
     code = FrameCode(b)
     code.version == 0 || error("unsupported version")
-    vi, pos = readvarint(buf, pos, len)
-    framelen = (vi << 4) + code.length
-    payload = code.compressed ? decompress(buf, pos, len, framelen) : slice(buf, pos, framelen)
-    return Frame(code, framelen, payload), pos + framelen
+    vi, pos = readuvarint(buf, pos, len)
+    framelen = Int((vi << 4) + code.length)
+    payload, frpos = code.compressed ? (decompress(buf, pos, len, framelen), 1) : (buf, pos)
+    return Frame(code, framelen, payload, frpos), pos + framelen
 end
-
-slice(buf, pos, len) = unsafe_wrap(Array, pointer(buf, pos), len)
 
 @enum CompressionFormat CompressionFormatLZ4=0x00
 
@@ -56,8 +55,9 @@ function decompress(buf, pos, len, totalLength)
     CompressionFormat(f) == CompressionFormatLZ4 || error("unsupported compression format: " + f)
     pos += 1
     startpos = pos
-    uncompressedSize, pos = readvarint(buf, pos, len)
-    compressedPayload = slice(buf, pos, totalLength - (pos - startpos) - 1)
+    uncompressedSize, pos = readuvarint(buf, pos, len)
+    #TODO: fix
+    # compressedPayload = slice(buf, pos, totalLength - (pos - startpos) - 1)
     return transcode(LZ4FrameDecompressor, compressedPayload)
 end
 
@@ -76,9 +76,9 @@ function read(buf)
         frame, pos = readframe(buf, pos, len)
         push!(frames, frame)
         if frame.code.type == FrameType.Values
-            push!(values, readvalues(ctx, frame.payload))
+            push!(values, readvalues(ctx, frame.payload, frame.pos, frame.length))
         elseif frame.code.type == FrameType.Types
-            decodeTypes!(ctx, frame.payload)
+            decodeTypes!(ctx, frame.payload, frame.pos, frame.length)
         elseif frame.code.type == FrameType.Control
 
         else

@@ -11,18 +11,11 @@ abstract type Integer <: Number end
 abstract type Signed <: Integer end
 abstract type Float <: Number end
 
-abstract type Record <: ZType end
-abstract type Array <: ZType end
-abstract type Set <: ZType end
-abstract type Map <: ZType end
-abstract type Union <: ZType end
-abstract type Enum <: ZType end
-abstract type Error <: ZType end
-
 # by default, types store their id
 # primitive types overload directly
 typeid(x) = x.id
 ztype(id) = ZTYPE_PRIMITIVES[id]
+juliatype(f, type::T) where {T <: ZType} = f(juliatype(type))
 
 const ZTYPE_PRIMITIVES = Dict{Int, ZType}()
 
@@ -84,9 +77,9 @@ end
 struct TypeContext
     lock::ReentrantLock
     byID::Vector{ZType}
-    toType::Dict{String, ZType}
-    toValue::Dict{ZType, String}
-    typedefs::Dict{String, TypeNamed}
+    toType::Dict{Vector{UInt8}, ZType}
+    toValue::Dict{ZType, Vector{UInt8}}
+    typedefs::Dict{Vector{UInt8}, TypeNamed}
     # stringErr *TypeError
     # missing   *Value
     # quiet     *Value
@@ -97,15 +90,26 @@ TypeContext() = TypeContext(ReentrantLock(), Vector{ZType}(undef, typeid(Types.T
 nextid(ctx) = length(ctx.byID) + 1
 
 # MUST be called while holding lock
-function add!(c, type::ZType)
-    tv = string(type)
+function add!(c, tbytes, type::ZType)
+    tv = copy(tbytes)
     c.toValue[type] = tv
     c.toType[tv] = type
     push!(c.byID, type)
     return
 end
 
-function Types.ztype(ctx::TypeContext, id::Int)
+function add!(f::Function, ctx, buf, startpos, pos)
+    tbytes = view(buf, startpos:(pos - 1))
+    Base.@lock ctx.lock begin
+        if !haskey(ctx.toType, tbytes)
+            # we haven't seen this type before
+            id = nextid(ctx)
+            add!(ctx, tbytes, f(id))
+        end
+    end
+end
+
+function Types.ztype(ctx::TypeContext, id::Integer)
     if id < typeid(Types.TypeComplex)
         # primitive type
         return Types.ztype(id)
@@ -115,48 +119,78 @@ function Types.ztype(ctx::TypeContext, id::Int)
     end
 end
 
-struct Column
+struct Field
     name::String
     type::ZType
 end
 
-struct RecordType <: ZType
+struct TypeRecord <: ZType
     id::Int
-    columns::Vector{Column}
-    lu::Dict{String, Int} # column name => column index
+    fields::Vector{Field}
+    lu::Dict{String, Int} # field name => field index
 end
 
-RecordType(id, cols) = RecordType(id, cols, Dict(c.name => i for (i, c) in enumerate(cols)))
+TypeRecord(id, fields) = TypeRecord(id, fields, Dict(c.name => i for (i, c) in enumerate(fields)))
 
-# lazy NamedTuple; instance of a RecordType object
-struct Record
-    names::Vector{Symbol}
-    values::Vector{Any}
+Types.juliatype(T::TypeRecord) = NamedTuple{Tuple(Symbol(f.name) for f in T.fields), Tuple{(juliatype(f.type) for f in T.fields)...}}
+
+struct TypeArray <: ZType
+    id::Int
+    type::ZType
 end
 
-Base.propertynames(x::Record) = x.names
-function Base.getproperty(x::Record, nm::Symbol)
-    i = 1
-    for n in getfield(x, :names)
-        if n === nm
-            return @inbounds getfield(x, :values)[i]
-        end
-        i += 1
-    end
-    error("Record has no property $nm")
+Types.juliatype(T::TypeArray) = Vector{juliatype(T.type)}
+
+struct TypeError <: ZType
+    id::Int
+    type::ZType
 end
 
-function Base.show(io::IO, x::Record)
-    print(io, "Record(")
-    for (i, n) in enumerate(getfield(x, :names))
-        if i > 1
-            print(io, ", ")
-        end
-        print(io, n, " = ")
-        show(io, getfield(x, :values)[i])
-    end
-    print(io, ")")
+struct Error{T} <: Exception
+    value::T
 end
+
+Types.juliatype(T::TypeError) = Error{juliatype(T.type)}
+
+struct TypeEnum <: ZType
+    id::Int
+    symbols::Vector{String}
+end
+
+Types.juliatype(T::TypeEnum) = Symbol
+
+struct TypeMap <: ZType
+    id::Int
+    keytype::ZType
+    valtype::ZType
+end
+
+Types.juliatype(T::TypeMap) = Dict{juliatype(T.keytype), juliatype(T.valtype)}
+
+struct TypeNamed <: ZType
+    id::Int
+    name::String
+    type::ZType
+end
+
+Types.juliatype(T::TypeNamed) = juliatype(T.type)
+
+struct TypeSet <: ZType
+    id::Int
+    type::ZType
+end
+
+Types.juliatype(T::TypeSet) = Set{juliatype(T.type)}
+
+struct TypeUnion <: ZType
+    id::Int
+    types::Vector{ZType}
+    lu::Dict{ZType, Int}
+end
+
+TypeUnion(id::Int, types::Vector{ZType}) = TypeUnion(id, types, Dict(typ => i for (i, typ) in enumerate(types)))
+
+Types.juliatype(T::TypeUnion) = Union{map(juliatype, T.types)...}
 
 const TypeDefRecord = 0
 const TypeDefArray  = 1
@@ -168,51 +202,77 @@ const TypeDefError  = 6
 const TypeDefName   = 7
 
 # buf is the payload of a Types frame
-function decodeTypes!(ctx, buf)
-    pos = 1
-    len = length(buf)
+function decodeTypes!(ctx, buf, pos, len)
     while pos <= len
+        startpos = pos
         b = buf[pos]
         pos += 1
         if b == TypeDefRecord
-            ncols, pos = readvarint(buf, pos, len)
-            cols = Vector{Column}(undef, ncols)
-            for i = 1:ncols
+            nfields, pos = readuvarint(buf, pos, len)
+            #TODO: we could probably skip allocating this fields
+            # array + each field and just scan the full type def
+            # and check if we've seen it in the TypeContext 1st
+            # and go back and fully parse them all if not
+            fields = Vector{Field}(undef, nfields)
+            for i = 1:nfields
                 name, pos = readCountedString(buf, pos, len)
-                id, pos = readvarint(buf, pos, len)
+                id, pos = readuvarint(buf, pos, len)
                 T = ztype(ctx, id)
-                cols[i] = Column(name, T)
+                fields[i] = Field(name, T)
             end
-            # duplicate column check
-            # lookup type by string representation
-            # otherwise, create new type and insert into type context
-            Base.@lock ctx.lock begin
-                id = nextid(ctx)
-                rec = RecordType(id, cols)
-                add!(ctx, rec)
+            add!(ctx, buf, startpos, pos) do id
+                TypeRecord(id, fields)
             end
-        elseif b == TypeDefArray
-            
-        elseif b == TypeDefSet
-            
+        elseif b == TypeDefArray || b == TypeDefSet || b == TypeDefError
+            id, pos = readuvarint(buf, pos, len)
+            inner = ztype(ctx, id)
+            add!(ctx, buf, startpos, pos) do id
+                b == TypeDefArray ? TypeArray(id, inner) : b == TypeDefSet ? TypeSet(id, inner) : TypeError(id, inner)
+            end
         elseif b == TypeDefMap
-            
+            id, pos = readuvarint(buf, pos, len)
+            keytype = ztype(ctx, id)
+            id, pos = readuvarint(buf, pos, len)
+            valtype = ztype(ctx, id)
+            add!(ctx, buf, startpos, pos) do id
+                TypeMap(id, keytype, valtype)
+            end
         elseif b == TypeDefUnion
-            
+            ntyp, pos = readuvarint(buf, pos, len)
+            @assert ntyp > 0
+            types = Vector{ZType}(undef, ntyp)
+            for i = 1:ntyp
+                id, pos = readuvarint(buf, pos, len)
+                types[i] = ztype(ctx, id)
+            end
+            add!(ctx, buf, startpos, pos) do id
+                TypeUnion(id, types)
+            end
         elseif b == TypeDefEnum
-            
-        elseif b == TypeDefError
-            
+            nsym, pos = readuvarint(buf, pos, len)
+            symbols = Vector{String}(undef, nsym)
+            for i = 1:nsym
+                name, pos = readCountedString(buf, pos, len)
+                symbols[i] = name
+            end
+            add!(ctx, buf, startpos, pos) do id
+                TypeEnum(id, symbols)
+            end
         elseif b == TypeDefName
-
+            name, pos = readCountedString(buf, pos, len)
+            id, pos = readuvarint(buf, pos, len)
+            inner = ztype(ctx, id)
+            add!(ctx, buf, startpos, pos) do id
+                TypeNamed(id, name, inner)
+            end
         else
-            error("unsupported type definition: " + b)
+            error("unsupported type definition: $b")
         end
     end
 end
 
 function readCountedString(buf, pos, len)
-    n, pos = readvarint(buf, pos, len)
+    n, pos = readuvarint(buf, pos, len)
     str = unsafe_string(pointer(buf, pos), n)
     return str, pos + n
 end
