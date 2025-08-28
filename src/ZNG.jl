@@ -43,30 +43,32 @@ function readframe(buf, pos, len)
     code.version == 0 || error("unsupported version")
     vi, pos = readuvarint(buf, pos, len)
     framelen = Int((vi << 4) + code.length)
-    payload, frpos = code.compressed ? (decompress(buf, pos, len, framelen), 1) : (buf, pos)
-    return Frame(code, framelen, payload, frpos), pos + framelen
+    payload, frlen, frpos = code.compressed ? decompress(buf, pos, len, framelen) : (buf, framelen, pos)
+    return Frame(code, frlen, payload, frpos), pos + framelen
 end
 
 @enum CompressionFormat CompressionFormatLZ4=0x00
 
-function decompress(buf, pos, len, totalLength)
+function decompress(buf, pos, len, framelen)
     pos > len && error("Unexpected EOF")
     f = buf[pos]
     CompressionFormat(f) == CompressionFormatLZ4 || error("unsupported compression format: " + f)
     pos += 1
     startpos = pos
     uncompressedSize, pos = readuvarint(buf, pos, len)
-    #TODO: fix
-    # compressedPayload = slice(buf, pos, totalLength - (pos - startpos) - 1)
-    return transcode(LZ4FrameDecompressor, compressedPayload)
+    GC.@preserve buf begin
+        compressedPayload = unsafe_wrap(Array, pointer(buf, pos), framelen - (pos - startpos) - 1)
+        return lz4_decompress(compressedPayload, uncompressedSize), uncompressedSize, 1
+    end
 end
 
-function read(buf)
-    pos = 1
-    len = length(buf)
-    values = Vector{Value}[]
+function _read(buf, pos=1, len=length(buf))
+    values = Value[]
     frames = Frame[]
     ctx = TypeContext()
+    #TODO: implement control frame handling
+    #TODO: allow concurrent frame reading
+      # we'll want to push frame decompressing down to the decodeTypes or readvalue functions
     while pos <= len
         if buf[pos] == EOS
             # encountered end-of-stream, reset type context, then continue reading
@@ -76,7 +78,7 @@ function read(buf)
         frame, pos = readframe(buf, pos, len)
         push!(frames, frame)
         if frame.code.type == FrameType.Values
-            push!(values, readvalues(ctx, frame.payload, frame.pos, frame.length))
+            push!(values, readvalue(ctx, frame.payload, frame.pos, frame.length))
         elseif frame.code.type == FrameType.Types
             decodeTypes!(ctx, frame.payload, frame.pos, frame.length)
         elseif frame.code.type == FrameType.Control
@@ -85,16 +87,19 @@ function read(buf)
             error("unsupported frame type: " + frame.code.type)
         end
     end
-    return values, frames
+    return values, frames, ctx
+end
+
+function read(buf, pos=1, len=length(buf))
+    values, frames, ctx = _read(buf, pos, len)
+    return length(values) == 1 ? values[1] : values
 end
 
 end # module ZNG
 
 # TODO
- # test reading other primitive types
- # implement other complex types
  # writing
- # zed_jll for round-trip testing
+ # zed_jll for round-trip testing of all types
  # benchmark
  # concurrent frame reading/writing?
  # basic control frame decoding

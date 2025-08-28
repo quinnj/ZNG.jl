@@ -2,7 +2,7 @@
 
 julia_version = "1.10.3"
 manifest_format = "2.0"
-project_hash = "57d9872797b4d61692b7805044e858df6114e8b3"
+project_hash = "90212524f2b0ae9faccb086d021f87c0c041a5b2"
 
 [[deps.Artifacts]]
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
@@ -12,6 +12,12 @@ deps = ["Lz4_jll", "TranscodingStreams"]
 git-tree-sha1 = "b8aecef9f90530cf322a8386630ec18485c17991"
 uuid = "5ba52731-8f18-5e0d-9241-30f10d1ec561"
 version = "0.4.3"
+
+[[deps.ConcurrentUtilities]]
+deps = ["Serialization", "Sockets"]
+git-tree-sha1 = "6cbbd4d241d7e6579ab354737f4dd95ca43946e1"
+uuid = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
+version = "2.4.1"
 
 [[deps.Dates]]
 deps = ["Printf"]
@@ -54,6 +60,12 @@ uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 [[deps.SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 version = "0.7.0"
+
+[[deps.Serialization]]
+uuid = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+
+[[deps.Sockets]]
+uuid = "6462fe0b-24de-5631-8697-dd941f90decc"
 
 [[deps.Structs]]
 deps = ["Dates", "UUIDs"]

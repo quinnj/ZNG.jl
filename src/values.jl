@@ -5,15 +5,27 @@ struct Value
     n::Int
 end
 
+Structs.@selectors Value
+
 gettype(x::Value) = getfield(x, :type)
 getbuf(x::Value) = getfield(x, :buf)
 getpos(x::Value) = getfield(x, :pos)
 getn(x::Value) = getfield(x, :n)
 @inline getfields(x::Value) = (gettype(x), getbuf(x), getpos(x), getn(x))
 
+function uniontype(x::Value)
+    type = gettype(x)
+    @assert type isa TypeUnion
+    _, buf, pos, n = getfields(x)
+    n, pos = readtag(buf, pos, pos + n - 1)
+    id = decode_counted_varint(buf, pos, n)
+    return type.types[id + 1]
+end
+
 function Types.juliatype(f, x::Value)
     type = gettype(x)
     if type isa TypeRecord
+        #TODO: can we do anything more efficient here than dynamically constructing a NamedTuple type?
         Types.juliatype(T -> f(NamedTuple{Tuple(Symbol(f.name) for f in type.fields), Tuple{(juliatype(f.type) for f in type.fields)...}}), type)
     elseif type isa TypeArray
         Types.juliatype(T -> f(Vector{T}), type.type)
@@ -31,26 +43,29 @@ end
 
 Base.show(io::IO, x::Value) = show(io, x[])
 
-struct ZedStyle <: Structs.StructStyle end
+struct ZNGStyle <: Structs.StructStyle end
 
-Structs.structlike(x::Value) = gettype(x) isa TypeRecord
-Structs.arraylike(x::Value) = gettype(x) isa TypeArray || gettype(x) isa TypeSet
-Structs.nulllike(x::Value) = getn(x) == -1 || gettype(x) == Types.Null
+Structs.structlike(x::Value) = gettype(x) isa TypeRecord || gettype(x) isa TypeUnion && Structs.structlike(uniontype(x))
+Structs.arraylike(x::Value) = gettype(x) isa TypeArray || gettype(x) isa TypeSet || gettype(x) isa TypeUnion && Structs.arraylike(uniontype(x))
+Structs.nulllike(x::Value) = getn(x) == -1 || gettype(x) == Types.Null || gettype(x) isa TypeUnion && Structs.nulllike(uniontype(x))
 
 @inline function Structs.choosetype(f::F, style::Structs.StructStyle, ::Type{T}, x::Value, tags) where {F, T}
     return Types.juliatype(type -> f(style, type, x, tags), x)
 end
 
-Base.getindex(x::Value) = Structs.make(ZedStyle(), Any, x)
+Base.getindex(x::Value) = Structs.make(ZNGStyle(), Any, x)
 
-@inline function Structs.lift(f::F, style::ZedStyle, ::Type{T}, x::Value, tags) where {F, T}
+@inline function Structs.lift(f::F, style::Structs.StructStyle, ::Type{T}, x::Value, tags) where {F, T}
     # deserialize based on type
     type, buf, pos, n = getfields(x)
     if type == Types.Null || n == -1
         return Structs.lift(f, style, T, nothing, tags)
     end
-    if type isa Types.Integer
+    if type isa Types.Signed
         v = decode_counted_varint(buf, pos, n)
+        return Structs.lift(f, style, T, v, tags)
+    elseif type isa Types.Integer
+        v = decode_counted_uvarint(buf, pos, n)
         return Structs.lift(f, style, T, v, tags)
     elseif type isa Types.Float
         ptr::Ptr{juliatype(type)} = pointer(buf, pos)
@@ -79,12 +94,16 @@ end
 @inline function Structs.applyeach(style::Structs.StructStyle, f::F, x::Value) where {F}
     type, buf, pos, n = getfields(x)
     len = pos + n - 1
-    if type isa TypeUnion
-        n, pos = readtag(buf, pos, pos + n - 1)
-        id = decode_counted_varint(buf, pos, n)
-        type = type.types[id+1]
-        pos += n
-        n, pos = readtag(buf, pos, length(buf))
+    while type isa TypeNamed || type isa TypeUnion
+        if type isa TypeNamed
+            type = type.type
+        elseif type isa TypeUnion
+            n, pos = readtag(buf, pos, len)
+            id = decode_counted_varint(buf, pos, n)
+            type = type.types[id+1]
+            pos += n
+            n, pos = readtag(buf, pos, len)
+        end
     end
     if type isa TypeRecord
         fields = type.fields
@@ -117,17 +136,12 @@ function readtag(buf, pos, len)
 end
 
 # buf, pos, len = frame.payload, frame.pos, frame.length
-function readvalues(ctx, buf, pos, len)
+function readvalue(ctx, buf, pos, len)
     # buf is the payload of a Values frame
-    values = Value[]
-    while pos <= len
-        # each top-level value is preceeded by a varint type id
-        # that MUST correspond to a type definition in a Types frame
-        id, pos = readuvarint(buf, pos, len)
-        # every value is tag-encoded, which gives us the length of the value
-        n, pos = readtag(buf, pos, len)
-        push!(values, Value(ztype(ctx, id), buf, pos, n))
-        pos += n
-    end
-    return values
+    # each top-level value is preceeded by a varint type id
+    # that MUST correspond to a type definition in a Types frame
+    id, pos = readuvarint(buf, pos, len)
+    # every value is tag-encoded, which gives us the length of the value
+    n, pos = readtag(buf, pos, len)
+    return Value(ztype(ctx, id), buf, pos, n)
 end
